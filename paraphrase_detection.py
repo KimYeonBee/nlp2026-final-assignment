@@ -128,7 +128,7 @@ def train(args):
   if args.use_wandb:
     wandb.init(
         project='paraphrase_detection',
-        name=f'gpt2-{args.dataset}-lr{args.lr}-bs{args.batch_size}-epoch{args.epochs}', # 기타 수정한 사항 name에 구분가게 표시
+        name=f'gpt2-{config["dataset"]}-lr{args.lr}-bs{args.batch_size}-epoch{args.epochs}', # 기타 수정한 사항 name에 구분가게 표시
         config=config
     )
 
