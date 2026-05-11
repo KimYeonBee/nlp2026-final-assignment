@@ -32,6 +32,8 @@ from models.gpt2 import GPT2Model
 
 from optimizer import AdamW
 
+import wandb # 나중에 삭제
+
 TQDM_DISABLE = False
 
 # Fix the random seed.
@@ -107,6 +109,29 @@ def train(args):
                                    collate_fn=para_dev_data.collate_fn)
 
   args = add_arguments(args)
+
+  # 나중에 삭제
+  config = {
+      "task": "quora_paraphrase_detection",
+      "model": "GPT-2",
+      "train_file": args.para_train,
+      "dev_file": args.para_dev,
+      "test_file": args.para_test,
+      "batch_size": args.batch_size,
+      "epochs": args.epochs,
+      "lr": args.lr,
+      "use_gpu": args.use_gpu,
+      "device": str(device),
+      "dataset": 'quora'
+  }
+
+  if args.use_wandb:
+    wandb.init(
+        project='paraphrase_detection',
+        name=f'gpt2-{args.dataset}-lr{args.lr}-bs{args.batch_size}-epoch{args.epochs}', # 기타 수정한 사항 name에 구분가게 표시
+        config=config
+    )
+
   model = ParaphraseGPT(args)
   model = model.to(device)
 
@@ -144,8 +169,18 @@ def train(args):
       best_dev_acc = dev_acc
       save_model(model, optimizer, args, args.filepath)
 
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
+    # 나중에 삭제
+    if args.use_wandb:
+      wandb.log({
+          "epoch": epoch,
+          "train_loss": train_loss,
+          "dev_acc": dev_acc,
+          "dev_f1": dev_f1,
+          "best_dev_acc": best_dev_acc,
+          "lr": lr,
+      })
 
+    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
 
 @torch.no_grad()
 def test(args):
@@ -197,6 +232,8 @@ def get_args():
   parser.add_argument("--seed", type=int, default=11711)
   parser.add_argument("--epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
+  # 나중에 삭제
+  parser.add_argument('--use_wandb', action='store_true')
 
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
@@ -233,3 +270,7 @@ if __name__ == "__main__":
   seed_everything(args.seed)  # 재현성을 위한 random seed 고정.
   train(args)
   test(args)
+
+  # 나중에 삭제
+  if args.use_wandb:
+    wandb.finish()

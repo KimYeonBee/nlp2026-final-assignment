@@ -100,7 +100,7 @@ class ParaphraseDetectionTestDataset(Dataset):
 def load_paraphrase_data(paraphrase_filename, split='train'):
   paraphrase_data = []
   if split == 'test':
-    with open(paraphrase_filename, 'r') as fp:
+    with open(file=paraphrase_filename, mode='r', encoding="utf-8-sig") as fp:
       for record in csv.DictReader(fp, delimiter='\t'):
         sent_id = record['id'].lower().strip()
         paraphrase_data.append((preprocess_string(record['sentence1']),
@@ -108,7 +108,7 @@ def load_paraphrase_data(paraphrase_filename, split='train'):
                                 sent_id))
 
   else:
-    with open(paraphrase_filename, 'r') as fp:
+    with open(file=paraphrase_filename, mode='r', encoding="utf-8-sig") as fp:
       for record in csv.DictReader(fp, delimiter='\t'):
         try:
           sent_id = record['id'].lower().strip()
@@ -131,7 +131,7 @@ class SonnetsDataset(Dataset):
 
   def _load_sonnets(self, file_path):
     """Reads the file and extracts individual sonnets."""
-    with open(file_path, 'r', encoding='utf-8') as f:
+    with open(file=file_path, mode='r', encoding='utf-8') as f:
       text = f.read()
 
     # Split sonnets based on numbering pattern (e.g., "\n\n1\n\n")
