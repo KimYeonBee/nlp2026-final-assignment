@@ -120,6 +120,8 @@ def train(args):
       "batch_size": args.batch_size,
       "epochs": args.epochs,
       "lr": args.lr,
+      "weight_decay": args.weight_decay,
+      "patience": args.patience,
       "use_gpu": args.use_gpu,
       "device": str(device),
       "dataset": 'quora'
@@ -128,7 +130,7 @@ def train(args):
   if args.use_wandb:
     wandb.init(
         project='paraphrase_detection',
-        name=f'gpt2-{config["dataset"]}-lr{args.lr}-bs{args.batch_size}-epoch{args.epochs}', # 기타 수정한 사항 name에 구분가게 표시
+        name=f'gpt2-{config["dataset"]}-lr{args.lr}-epoch{args.epochs}-patience{args.patience}-weight_decay{args.weight_decay}', # 기타 수정한 사항 name에 구분가게 표시
         config=config
     )
 
@@ -136,13 +138,17 @@ def train(args):
   model = model.to(device)
 
   lr = args.lr
-  optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.)
+  optimizer = AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
   best_dev_acc = 0
+  best_epoch = -1
+  no_improvement = 0
 
   for epoch in range(args.epochs):
     model.train()
     train_loss = 0
     num_batches = 0
+    train_correct = 0
+    train_total = 0
     for batch in tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
       # 입력을 가져와서 GPU로 보내기(이 모델을 CPU에서 훈련시키는 것을 권장하지 않는다).
       b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels'].flatten()
@@ -150,7 +156,7 @@ def train(args):
       b_mask = b_mask.to(device)
       labels = labels.to(device)
 
-      # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트. 
+      # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트.
       optimizer.zero_grad()
       logits = model(b_ids, b_mask)
       preds = torch.argmax(logits, dim=1)
@@ -160,27 +166,40 @@ def train(args):
 
       train_loss += loss.item()
       num_batches += 1
+      train_correct += (preds == labels).sum().item()
+      train_total += labels.size(0)
 
     train_loss = train_loss / num_batches
+    train_acc = train_correct / train_total
 
     dev_acc, dev_f1, *_ = model_eval_paraphrase(para_dev_dataloader, model, device)
 
     if dev_acc > best_dev_acc:
       best_dev_acc = dev_acc
+      best_epoch = epoch
+      no_improvement = 0
       save_model(model, optimizer, args, args.filepath)
+    else:
+      no_improvement += 1
 
     # 나중에 삭제
     if args.use_wandb:
       wandb.log({
           "epoch": epoch,
           "train_loss": train_loss,
+          "train_acc": train_acc,
           "dev_acc": dev_acc,
           "dev_f1": dev_f1,
           "best_dev_acc": best_dev_acc,
+          "best_epoch": best_epoch,
           "lr": lr,
       })
 
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
+    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f} (best {best_dev_acc :.3f} @ epoch {best_epoch})")
+
+    if args.patience is not None and no_improvement >= args.patience:
+      print(f"Early stopping at epoch {epoch} (best dev acc {best_dev_acc :.3f} @ epoch {best_epoch})")
+      break
 
 @torch.no_grad()
 def test(args):
@@ -237,6 +256,9 @@ def get_args():
 
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
+  parser.add_argument("--patience", type=int, default=None,
+                      help="early stopping patience (epochs without dev improvement). 지정하지 않으면 비활성화")
+  parser.add_argument("--weight_decay", type=float, default=0.01)
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
@@ -266,7 +288,7 @@ def add_arguments(args):
 
 if __name__ == "__main__":
   args = get_args()
-  args.filepath = f'{args.epochs}-{args.lr}-paraphrase.pt'  # 경로명 저장.
+  args.filepath = f'{args.epochs}-{args.lr}-wd{args.weight_decay}-pat{args.patience}-paraphrase.pt'  # 경로명 저장.
   seed_everything(args.seed)  # 재현성을 위한 random seed 고정.
   train(args)
   test(args)
