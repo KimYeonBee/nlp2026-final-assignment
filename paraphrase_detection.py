@@ -59,7 +59,7 @@ class ParaphraseGPT(nn.Module):
     for param in self.gpt.parameters():
       param.requires_grad = True
 
-  def forward(self, input_ids, attention_mask):
+  def forward(self, input_ids, attention_mask, return_lm_logits=False):
     """
     TODO: paraphrase_detection_head Linear layer를 사용하여 토큰의 레이블을 예측하시오.
 
@@ -67,15 +67,21 @@ class ParaphraseGPT(nn.Module):
 
       'Is "{s1}" a paraphrase of "{s2}"? Answer "yes" or "no": '
 
-    따라서, 문장의 끝에서 다음 토큰에 대한 예측을 해야 할 것이다. 
-    훈련이 잘 되었다면, 패러프레이즈인 경우에는 토큰 "yes"(BPE index 8505)가, 
+    따라서, 문장의 끝에서 다음 토큰에 대한 예측을 해야 할 것이다.
+    훈련이 잘 되었다면, 패러프레이즈인 경우에는 토큰 "yes"(BPE index 8505)가,
     패러프레이즈가 아닌 경우에는 토큰 "no" (BPE index 3919)가 될 것이다.
+
+    return_lm_logits=True 일 때 (class_logits, lm_logits) 튜플 반환.
+    lm_logits 는 전체 시퀀스에 대한 vocab logits [B, S, V] — LM loss 계산용.
     """
     ### 완성시켜야 할 빈 코드 블록
     outputs = self.gpt(input_ids, attention_mask)
     last_token = outputs['last_token']
     logits = self.gpt.hidden_state_to_token(last_token)
 
+    if return_lm_logits:
+      lm_logits = self.gpt.hidden_state_to_token(outputs['last_hidden_state'])
+      return logits, lm_logits
     return logits
   
 
@@ -122,6 +128,7 @@ def train(args):
       "lr": args.lr,
       "weight_decay": args.weight_decay,
       "patience": args.patience,
+      "lm_lambda": args.lm_lambda,
       "use_gpu": args.use_gpu,
       "device": str(device),
       "dataset": 'quora'
@@ -130,7 +137,7 @@ def train(args):
   if args.use_wandb:
     wandb.init(
         project='paraphrase_detection',
-        name=f'gpt2-{config["dataset"]}-lr{args.lr}-epoch{args.epochs}-patience{args.patience}-weight_decay{args.weight_decay}', # 기타 수정한 사항 name에 구분가게 표시
+        name=f'gpt2-{config["dataset"]}-lr{args.lr}-epoch{args.epochs}-patience{args.patience}-wd{args.weight_decay}-lmlam{args.lm_lambda}', # 기타 수정한 사항 name에 구분가게 표시
         config=config
     )
 
@@ -143,9 +150,13 @@ def train(args):
   best_epoch = -1
   no_improvement = 0
 
+  use_lm_loss = args.lm_lambda > 0
+
   for epoch in range(args.epochs):
     model.train()
     train_loss = 0
+    train_class_loss = 0
+    train_lm_loss = 0
     num_batches = 0
     train_correct = 0
     train_total = 0
@@ -158,18 +169,41 @@ def train(args):
 
       # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트.
       optimizer.zero_grad()
-      logits = model(b_ids, b_mask)
+      if use_lm_loss:
+        logits, lm_logits = model(b_ids, b_mask, return_lm_logits=True)
+        # next-token prediction: position i predicts token i+1
+        shift_logits = lm_logits[:, :-1, :].contiguous()
+        shift_labels = b_ids[:, 1:].contiguous()
+        shift_mask = b_mask[:, 1:].contiguous()
+        # padding 위치는 ignore_index=-100 로 마스킹
+        shift_labels = shift_labels.masked_fill(shift_mask == 0, -100)
+        lm_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+            reduction='mean',
+        )
+      else:
+        logits = model(b_ids, b_mask)
+        lm_loss = torch.tensor(0.0, device=device)
+
+      class_loss = F.cross_entropy(logits, labels, reduction='mean')
+      loss = class_loss + args.lm_lambda * lm_loss
       preds = torch.argmax(logits, dim=1)
-      loss = F.cross_entropy(logits, labels, reduction='mean')
+
       loss.backward()
       optimizer.step()
 
       train_loss += loss.item()
+      train_class_loss += class_loss.item()
+      train_lm_loss += lm_loss.item()
       num_batches += 1
       train_correct += (preds == labels).sum().item()
       train_total += labels.size(0)
 
     train_loss = train_loss / num_batches
+    train_class_loss = train_class_loss / num_batches
+    train_lm_loss = train_lm_loss / num_batches
     train_acc = train_correct / train_total
 
     dev_acc, dev_f1, *_ = model_eval_paraphrase(para_dev_dataloader, model, device)
@@ -187,6 +221,8 @@ def train(args):
       wandb.log({
           "epoch": epoch,
           "train_loss": train_loss,
+          "train_class_loss": train_class_loss,
+          "train_lm_loss": train_lm_loss,
           "train_acc": train_acc,
           "dev_acc": dev_acc,
           "dev_f1": dev_f1,
@@ -195,7 +231,7 @@ def train(args):
           "lr": lr,
       })
 
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f} (best {best_dev_acc :.3f} @ epoch {best_epoch})")
+    print(f"Epoch {epoch}: total loss :: {train_loss :.3f} (class {train_class_loss :.3f}, lm {train_lm_loss :.3f}), train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f} (best {best_dev_acc :.3f} @ epoch {best_epoch})")
 
     if args.patience is not None and no_improvement >= args.patience:
       print(f"Early stopping at epoch {epoch} (best dev acc {best_dev_acc :.3f} @ epoch {best_epoch})")
@@ -259,6 +295,8 @@ def get_args():
   parser.add_argument("--patience", type=int, default=None,
                       help="early stopping patience (epochs without dev improvement). 지정하지 않으면 비활성화")
   parser.add_argument("--weight_decay", type=float, default=0.01)
+  parser.add_argument("--lm_lambda", type=float, default=0.0,
+                      help="classification loss + lambda * LM loss. 0이면 LM loss 비활성 (기본 동작)")
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
@@ -288,7 +326,7 @@ def add_arguments(args):
 
 if __name__ == "__main__":
   args = get_args()
-  args.filepath = f'{args.epochs}-{args.lr}-wd{args.weight_decay}-pat{args.patience}-paraphrase.pt'  # 경로명 저장.
+  args.filepath = f'{args.epochs}-{args.lr}-wd{args.weight_decay}-pat{args.patience}-lmlam{args.lm_lambda}-paraphrase.pt'  # 경로명 저장.
   seed_everything(args.seed)  # 재현성을 위한 random seed 고정.
   train(args)
   test(args)
