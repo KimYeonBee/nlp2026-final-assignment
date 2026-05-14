@@ -148,7 +148,8 @@ def train(args):
 
   if args.resume_from is not None:
     print(f"Loading checkpoint from {args.resume_from}")
-    saved = torch.load(args.resume_from, map_location=device)
+    # map_location='cpu': RNG 텐서 device 충돌 회피 (cuda ByteTensor 는 set_rng_state 에 못 들어감)
+    saved = torch.load(args.resume_from, map_location='cpu')
     model.load_state_dict(saved['model'])
     optimizer.load_state_dict(saved['optim'])
     if 'system_rng' in saved:
