@@ -79,7 +79,7 @@ class ParaphraseGPT(nn.Module):
     return logits
   
 
-def save_model(model, optimizer, args, filepath):
+def save_model(model, optimizer, args, filepath, extra=None):
   save_info = {
     'model': model.state_dict(),
     'optim': optimizer.state_dict(),
@@ -88,6 +88,8 @@ def save_model(model, optimizer, args, filepath):
     'numpy_rng': np.random.get_state(),
     'torch_rng': torch.random.get_rng_state(),
   }
+  if extra is not None:
+    save_info.update(extra)
 
   torch.save(save_info, filepath)
   print(f"save the model to {filepath}")
@@ -142,8 +144,32 @@ def train(args):
   best_dev_acc = 0
   best_epoch = -1
   no_improvement = 0
+  start_epoch = 0
 
-  for epoch in range(args.epochs):
+  if args.resume_from is not None:
+    print(f"Loading checkpoint from {args.resume_from}")
+    saved = torch.load(args.resume_from, map_location=device)
+    model.load_state_dict(saved['model'])
+    optimizer.load_state_dict(saved['optim'])
+    if 'system_rng' in saved:
+      random.setstate(saved['system_rng'])
+    if 'numpy_rng' in saved:
+      np.random.set_state(saved['numpy_rng'])
+    if 'torch_rng' in saved:
+      torch.random.set_rng_state(saved['torch_rng'])
+    # checkpoint 에 진행 상태가 있으면 우선 사용, 없으면 CLI 인자 사용
+    if 'epoch' in saved:
+      start_epoch = saved['epoch'] + 1
+    else:
+      start_epoch = args.start_epoch
+    best_dev_acc = saved.get('best_dev_acc', args.initial_best_dev_acc)
+    best_epoch = saved.get('best_epoch', args.initial_best_epoch)
+    no_improvement = saved.get('no_improvement', args.initial_no_improvement)
+    del saved
+    print(f"Resumed: start_epoch={start_epoch}, best_dev_acc={best_dev_acc:.3f}, "
+          f"best_epoch={best_epoch}, no_improvement={no_improvement}")
+
+  for epoch in range(start_epoch, args.epochs):
     model.train()
     train_loss = 0
     num_batches = 0
@@ -178,9 +204,17 @@ def train(args):
       best_dev_acc = dev_acc
       best_epoch = epoch
       no_improvement = 0
-      save_model(model, optimizer, args, args.filepath)
+      save_model(model, optimizer, args, args.filepath,
+                 extra={'epoch': epoch, 'best_dev_acc': best_dev_acc,
+                        'best_epoch': best_epoch, 'no_improvement': no_improvement})
     else:
       no_improvement += 1
+
+    # 매 epoch latest checkpoint 저장 (OOM 등 재시작 대비)
+    latest_path = args.filepath.replace('.pt', '-latest.pt')
+    save_model(model, optimizer, args, latest_path,
+               extra={'epoch': epoch, 'best_dev_acc': best_dev_acc,
+                      'best_epoch': best_epoch, 'no_improvement': no_improvement})
 
     # 나중에 삭제
     if args.use_wandb:
@@ -263,6 +297,20 @@ def get_args():
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
 
+  # Resume from checkpoint
+  parser.add_argument("--resume_from", type=str, default=None,
+                      help="resume training from this checkpoint path")
+  parser.add_argument("--start_epoch", type=int, default=0,
+                      help="첫 학습 epoch (resume 시, checkpoint 에 epoch 없을 때만 사용)")
+  parser.add_argument("--initial_best_dev_acc", type=float, default=0.0,
+                      help="best_dev_acc 초기값 (resume 시, checkpoint 에 없을 때만 사용)")
+  parser.add_argument("--initial_best_epoch", type=int, default=-1,
+                      help="best_epoch 초기값 (resume 시, checkpoint 에 없을 때만 사용)")
+  parser.add_argument("--initial_no_improvement", type=int, default=0,
+                      help="no_improvement 카운터 초기값 (resume 시, checkpoint 에 없을 때만 사용)")
+  parser.add_argument("--skip_train", action='store_true',
+                      help="train() 건너뛰고 test() 만 실행")
+
   args = parser.parse_args()
   return args
 
@@ -290,7 +338,8 @@ if __name__ == "__main__":
   args = get_args()
   args.filepath = f'{args.epochs}-{args.lr}-wd{args.weight_decay}-pat{args.patience}-paraphrase.pt'  # 경로명 저장.
   seed_everything(args.seed)  # 재현성을 위한 random seed 고정.
-  train(args)
+  if not args.skip_train:
+    train(args)
   test(args)
 
   # 나중에 삭제
