@@ -33,6 +33,8 @@ from evaluation import (
   model_eval_paraphrase_calibrated,
   model_test_paraphrase_calibrated,
   estimate_prior,
+  model_eval_paraphrase_symmetric,
+  model_test_paraphrase_symmetric,
 )
 from models.gpt2 import GPT2Model
 
@@ -109,18 +111,34 @@ def train(args):
   """Quora 데이터셋에서 Paraphrase Detection을 위한 GPT-2 훈련."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   # 데이터, 해당 데이터셋 및 데이터로드 생성하기.
-  para_train_data = load_paraphrase_data(args.para_train)
+  para_train_raw = load_paraphrase_data(args.para_train)
+  if args.swap_augment:
+    swapped = [(s2, s1, label, f'{sid}_swap') for (s1, s2, label, sid) in para_train_raw]
+    para_train_raw = para_train_raw + swapped
+    print(f"swap_augment: train 데이터 {len(para_train_raw)} (2배)")
 
   # --para_dev 는 콤마 구분 다중 파일을 허용. 첫 번째 dev 가 model selection 기준.
   dev_files = _split_csv_arg(args.para_dev)
+  para_dev_raw_map = {}
   para_dev_loaders = []
   for fp in dev_files:
-    ds = ParaphraseDetectionDataset(load_paraphrase_data(fp), args)
+    raw = load_paraphrase_data(fp)
+    para_dev_raw_map[fp] = raw
+    ds = ParaphraseDetectionDataset(raw, args)
     loader = DataLoader(ds, shuffle=False, batch_size=args.batch_size,
                         collate_fn=ds.collate_fn)
     para_dev_loaders.append((fp, loader))
 
-  para_train_data = ParaphraseDetectionDataset(para_train_data, args)
+  # symmetric eval 용 swap-변환 dev loader (학습 epoch 평가용)
+  para_dev_swap_loaders = {}
+  if args.symmetric_eval:
+    for fp, raw in para_dev_raw_map.items():
+      ds_swap = ParaphraseDetectionDataset(raw, args, swap=True)
+      para_dev_swap_loaders[fp] = DataLoader(
+          ds_swap, shuffle=False, batch_size=args.batch_size,
+          collate_fn=ds_swap.collate_fn)
+
+  para_train_data = ParaphraseDetectionDataset(para_train_raw, args)
   if args.balanced_sampler:
     labels = [int(x[2]) for x in para_train_data.dataset]
     cnt0 = sum(1 for l in labels if l == 0)
@@ -207,11 +225,17 @@ def train(args):
 
     # 다중 dev: 첫 번째 = primary (early stopping / 저장 기준), 나머지는 모니터링용
     dev_metrics = {}
+    sym_dev_metrics = {}
     for fp, loader in para_dev_loaders:
       acc, f1, *_ = model_eval_paraphrase(loader, model, device)
       dev_metrics[fp] = (acc, f1)
       if fp != para_dev_loaders[0][0]:
         print(f"  aux dev [{fp}] acc :: {acc :.3f}, f1 :: {f1 :.3f}")
+      if args.symmetric_eval:
+        sym_acc, sym_f1, *_ = model_eval_paraphrase_symmetric(
+            loader, para_dev_swap_loaders[fp], model, device)
+        sym_dev_metrics[fp] = (sym_acc, sym_f1)
+        print(f"  sym dev [{fp}] acc :: {sym_acc :.3f}, f1 :: {sym_f1 :.3f}")
     dev_acc, dev_f1 = dev_metrics[para_dev_loaders[0][0]]
 
     if dev_acc > best_dev_acc:
@@ -246,6 +270,10 @@ def train(args):
           src = fp.rsplit("/", 1)[-1].rsplit(".", 1)[0]
         ablation_payload[f"dev_acc_{src}"] = acc
         ablation_payload[f"dev_f1_{src}"] = f1
+        if fp in sym_dev_metrics:
+          sym_acc, sym_f1 = sym_dev_metrics[fp]
+          ablation_payload[f"sym_dev_acc_{src}"] = sym_acc
+          ablation_payload[f"sym_dev_f1_{src}"] = sym_f1
       wandb.log(ablation_payload)
     # >>> END ABLATION-ONLY <<<
 
@@ -323,10 +351,26 @@ def test(args):
       for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
         f.write(f"{p}, {s} \n")
 
+    # symmetric_eval: 같은 dev 에 대해 swap 평균 예측을 *-symmetric.csv 로 따로 저장
+    if args.symmetric_eval:
+      ds_swap = ParaphraseDetectionDataset(data, args, swap=True)
+      loader_swap = DataLoader(ds_swap, shuffle=False, batch_size=args.batch_size,
+                               collate_fn=ds_swap.collate_fn)
+      sym_acc, _, sym_y_pred, _, sym_sent_ids = model_eval_paraphrase_symmetric(
+          loader, loader_swap, model, device)
+      print(f"dev paraphrase acc (symmetric) [{dev_fp}] :: {sym_acc :.3f}")
+      sym_out = dev_out_fp.replace('.csv', '-symmetric.csv')
+      with open(sym_out, "w+") as f:
+        f.write(f"id \t Predicted_Is_Paraphrase \n")
+        for p, s in zip(sym_sent_ids, sym_y_pred):
+          f.write(f"{p}, {s} \n")
+
   for test_fp, test_out_fp in zip(test_files, test_out_files):
     data = load_paraphrase_data(test_fp, split='test')
     ds = ParaphraseDetectionTestDataset(data, args)
-    loader = DataLoader(ds, shuffle=True, batch_size=args.batch_size, collate_fn=ds.collate_fn)
+    # symmetric 이면 shuffle 끄기 (orig/swap 페어링이 같은 순서여야 함)
+    test_shuffle = not args.symmetric_eval
+    loader = DataLoader(ds, shuffle=test_shuffle, batch_size=args.batch_size, collate_fn=ds.collate_fn)
     if args.prior_calibration:
       test_para_y_pred, test_para_sent_ids = model_test_paraphrase_calibrated(
           loader, model, device, prior_yes=prior_yes, prior_no=prior_no)
@@ -337,6 +381,19 @@ def test(args):
       f.write(f"id \t Predicted_Is_Paraphrase \n")
       for p, s in zip(test_para_sent_ids, test_para_y_pred):
         f.write(f"{p}, {s} \n")
+
+    if args.symmetric_eval:
+      ds_swap = ParaphraseDetectionTestDataset(data, args, swap=True)
+      loader_swap = DataLoader(ds_swap, shuffle=False, batch_size=args.batch_size,
+                               collate_fn=ds_swap.collate_fn)
+      sym_test_y_pred, sym_test_sent_ids = model_test_paraphrase_symmetric(
+          loader, loader_swap, model, device)
+      sym_out = test_out_fp.replace('.csv', '-symmetric.csv')
+      print(f"test predictions saved (symmetric) [{test_fp}] -> {sym_out}")
+      with open(sym_out, "w+") as f:
+        f.write(f"id \t Predicted_Is_Paraphrase \n")
+        for p, s in zip(sym_test_sent_ids, sym_test_y_pred):
+          f.write(f"{p}, {s} \n")
 
 
 def get_args():
@@ -363,6 +420,10 @@ def get_args():
                       help="WeightedRandomSampler 로 epoch 당 pos:neg 50:50 강제 (학습 데이터 mix 가 한쪽으로 쏠릴 때 FPR/FNR 균형 회복)")
   parser.add_argument("--prior_calibration", action='store_true',
                       help="추론 시 빈 문장 페어로 prior (yes/no logit) 추정 후 실제 logit 에서 차감. 사전 편향 제거 — bt 셀처럼 yes 쪽으로 쏠린 모델 보정에 사용.")
+  parser.add_argument("--swap_augment", action='store_true',
+                      help="훈련 데이터에 (S2,S1,label) swap 버전을 추가해 2배로 늘림 (순서 대칭성 학습)")
+  parser.add_argument("--symmetric_eval", action='store_true',
+                      help="dev/test 평가 시 (S1,S2)와 (S2,S1) yes/no logit 평균으로 추가 예측 → *-symmetric.csv 로 저장")
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')

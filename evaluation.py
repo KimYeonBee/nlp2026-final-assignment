@@ -133,6 +133,75 @@ def model_test_paraphrase(dataloader, model, device):
   return y_pred, sent_ids
 
 
+@torch.no_grad()
+def model_eval_paraphrase_symmetric(dataloader_orig, dataloader_swap, model, device):
+  """Symmetry consistency: (S1,S2) 와 (S2,S1) 두 방향 logits 평균으로 예측.
+  두 dataloader 는 동일한 데이터를 같은 순서로 (shuffle=False) 반환해야 함.
+  """
+  model.eval()
+  y_true, y_pred, sent_ids = [], [], []
+  for batch_orig, batch_swap in zip(
+      tqdm(dataloader_orig, desc='eval-symmetric', disable=TQDM_DISABLE),
+      dataloader_swap):
+    labels = batch_orig['labels'].flatten()
+    b_sent_ids = batch_orig['sent_ids']
+
+    b_ids_o = batch_orig['token_ids'].to(device)
+    b_mask_o = batch_orig['attention_mask'].to(device)
+    b_ids_s = batch_swap['token_ids'].to(device)
+    b_mask_s = batch_swap['attention_mask'].to(device)
+
+    logits_o = model(b_ids_o, b_mask_o)
+    logits_s = model(b_ids_s, b_mask_s)
+
+    score_yes = 0.5 * logits_o[:, YES_TOKEN_ID] + 0.5 * logits_s[:, YES_TOKEN_ID]
+    score_no = 0.5 * logits_o[:, NO_TOKEN_ID] + 0.5 * logits_s[:, NO_TOKEN_ID]
+    preds = torch.where(
+        score_yes > score_no,
+        torch.full_like(score_yes, YES_TOKEN_ID, dtype=torch.long),
+        torch.full_like(score_yes, NO_TOKEN_ID, dtype=torch.long),
+    ).cpu().numpy().flatten()
+
+    y_true.extend(labels.cpu().numpy() if torch.is_tensor(labels) else labels)
+    y_pred.extend(preds)
+    sent_ids.extend(b_sent_ids)
+
+  f1 = f1_score(y_true, y_pred, average='macro')
+  acc = accuracy_score(y_true, y_pred)
+  return acc, f1, y_pred, y_true, sent_ids
+
+
+@torch.no_grad()
+def model_test_paraphrase_symmetric(dataloader_orig, dataloader_swap, model, device):
+  """Test split 용 symmetric 예측. label 없음."""
+  model.eval()
+  y_pred, sent_ids = [], []
+  for batch_orig, batch_swap in zip(
+      tqdm(dataloader_orig, desc='eval-symmetric', disable=TQDM_DISABLE),
+      dataloader_swap):
+    b_sent_ids = batch_orig['sent_ids']
+
+    b_ids_o = batch_orig['token_ids'].to(device)
+    b_mask_o = batch_orig['attention_mask'].to(device)
+    b_ids_s = batch_swap['token_ids'].to(device)
+    b_mask_s = batch_swap['attention_mask'].to(device)
+
+    logits_o = model(b_ids_o, b_mask_o)
+    logits_s = model(b_ids_s, b_mask_s)
+
+    score_yes = 0.5 * logits_o[:, YES_TOKEN_ID] + 0.5 * logits_s[:, YES_TOKEN_ID]
+    score_no = 0.5 * logits_o[:, NO_TOKEN_ID] + 0.5 * logits_s[:, NO_TOKEN_ID]
+    preds = torch.where(
+        score_yes > score_no,
+        torch.full_like(score_yes, YES_TOKEN_ID, dtype=torch.long),
+        torch.full_like(score_yes, NO_TOKEN_ID, dtype=torch.long),
+    ).cpu().numpy().flatten()
+
+    y_pred.extend(preds)
+    sent_ids.extend(b_sent_ids)
+  return y_pred, sent_ids
+
+
 def test_sonnet(
     test_path='predictions/generated_sonnets.txt',
     gold_path='data/TRUE_sonnets_held_out.txt'
