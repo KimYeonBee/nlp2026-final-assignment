@@ -864,6 +864,13 @@ GPT-2 small 의 capacity 가 차이를 만들기 부족했을 가능성이 높�
       CE loss 와 0.1~0.3 비중으로 섞으면 ordering-invariance 함정에서 빠져나오기 좋다.</li>
   <li><b>R-Drop / consistency regularization</b>. 같은 페어에 dropout 만 다르게 2회 forward → KL term.
       모델 크기를 medium 으로 키운 지금 같은 시점에 ablation 차이를 키워주는 가장 싼 방법.</li>
+  <li><b>학습률 스케줄 (warmup + linear/cosine decay)</b> <span class="muted">[미시도 — 우선 후보]</span>.
+      현재 전 실험이 <b>고정 lr=1e-5</b> (warmup·decay 없음) 로만 돌았다. lr 을 5e-6 으로 단순 축소하면 dev 가 크게 하락하므로,
+      절대값이 아니라 <i>스케줄</i> 로 접근한다 — 초반 ~6~10 % step warmup 후 0 까지 linear / cosine decay.
+      Mosbach et al.(2021, ICLR) 은 BERT fine-tuning 에서 "10 % warmup + 선형 감소" 가 최종 성능 분산을 크게 줄이고 안정 수렴을 준다고 보고했다
+      (<a href="https://openreview.net/forum?id=nzpLWnVAyah">openreview.net/forum?id=nzpLWnVAyah</a>).
+      (1) 초반 발산 억제, (2) 후반 미세 수렴으로 dev 천장 부근 안정성·재현성 개선을 기대하며 학습률 감소 자체가 정규화 효과를 겸한다.
+      정규화/최적화 범주에서 <b>아직 한 번도 안 건드린 마지막 레버</b> 이므로 medium·전체 증강 구성 위에서 1 셀 추가 권장.</li>
 </ul>
 
 <h3>② 데이터 분포 자체를 손봐라</h3>
@@ -938,6 +945,7 @@ GPT-2 small 의 capacity 가 차이를 만들기 부족했을 가능성이 높�
 <tr><td>C4</td><td><code>medium-numswap</code></td><td>C1 + A2 산출물</td><td>MRPC numeric-mismatch slice 개선</td></tr>
 <tr><td>C5</td><td><code>medium-prompt-sep</code></td><td>C1 + prompts.py 의 separator / nli / symmetric variant</td><td>length-bias 감소, prompt 의존도 측정</td></tr>
 <tr><td>C6</td><td><code>medium-prior-cal</code></td><td>학습 X, 기존 모델 + <code>--prior_calibration</code></td><td>FPR/FNR 균형, MRPC bt 같이 yes-쏠림 모델 보정</td></tr>
+<tr><td>C7</td><td><code>medium-lrsched</code></td><td>C1 + warmup(6~10 %) + linear/cosine decay (lr=1e-5)</td><td>고정 lr 대비 dev 천장 부근 안정성·재현성, 정규화 효과</td></tr>
 </tbody>
 </table>
 

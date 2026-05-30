@@ -12,6 +12,7 @@ ParaphraseGPT model을 훈련 및 평가하고, 필요한 제출용 파일을 �
 '''
 
 import argparse
+import math
 import random
 import torch
 
@@ -68,7 +69,7 @@ class ParaphraseGPT(nn.Module):
     for param in self.gpt.parameters():
       param.requires_grad = True
 
-  def forward(self, input_ids, attention_mask):
+  def forward(self, input_ids, attention_mask, return_lm_logits=False):
     """
     TODO: paraphrase_detection_head Linear layer를 사용하여 토큰의 레이블을 예측하시오.
 
@@ -76,15 +77,21 @@ class ParaphraseGPT(nn.Module):
 
       'Is "{s1}" a paraphrase of "{s2}"? Answer "yes" or "no": '
 
-    따라서, 문장의 끝에서 다음 토큰에 대한 예측을 해야 할 것이다. 
-    훈련이 잘 되었다면, 패러프레이즈인 경우에는 토큰 "yes"(BPE index 8505)가, 
+    따라서, 문장의 끝에서 다음 토큰에 대한 예측을 해야 할 것이다.
+    훈련이 잘 되었다면, 패러프레이즈인 경우에는 토큰 "yes"(BPE index 8505)가,
     패러프레이즈가 아닌 경우에는 토큰 "no" (BPE index 3919)가 될 것이다.
+
+    return_lm_logits=True 일 때 (class_logits, lm_logits) 튜플 반환.
+    lm_logits 는 전체 시퀀스에 대한 vocab logits [B, S, V] — 보조 LM loss 계산용.
     """
     ### 완성시켜야 할 빈 코드 블록
     outputs = self.gpt(input_ids, attention_mask)
     last_token = outputs['last_token']
     logits = self.gpt.hidden_state_to_token(last_token)
 
+    if return_lm_logits:
+      lm_logits = self.gpt.hidden_state_to_token(outputs['last_hidden_state'])
+      return logits, lm_logits
     return logits
   
 
@@ -198,6 +205,32 @@ def train(args):
 
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
+
+  # LR 스케줄러 (default none → 기존 고정 lr 과 동일). warmup 후 linear/cosine decay.
+  total_steps = len(para_train_dataloader) * args.epochs
+  warmup_steps = int(args.warmup_ratio * total_steps)
+  def _lr_lambda(step):
+    if warmup_steps > 0 and step < warmup_steps:
+      return step / max(1, warmup_steps)
+    if args.lr_schedule == 'none':
+      return 1.0
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    progress = min(1.0, max(0.0, progress))
+    if args.lr_schedule == 'linear':
+      return 1.0 - progress
+    if args.lr_schedule == 'cosine':
+      return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return 1.0
+  scheduler = (torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+               if (args.lr_schedule != 'none' or warmup_steps > 0) else None)
+  if scheduler is not None:
+    print(f"lr_schedule={args.lr_schedule}, warmup_ratio={args.warmup_ratio} "
+          f"(total_steps={total_steps}, warmup_steps={warmup_steps})")
+
+  use_lm_loss = args.lm_lambda > 0
+  if use_lm_loss:
+    print(f"보조 LM loss 사용: lm_lambda={args.lm_lambda}")
+
   best_dev_acc = 0
   best_epoch = -1
   no_improvement = 0
@@ -217,11 +250,26 @@ def train(args):
 
       # 손실, 그래디언트를 계산하고 모델 파라미터 업데이트.
       optimizer.zero_grad()
-      logits = model(b_ids, b_mask)
+      if use_lm_loss:
+        # 분류 손실 + 보조 LM(next-token) 손실. lm_lambda 로 가중.
+        logits, lm_logits = model(b_ids, b_mask, return_lm_logits=True)
+        shift_logits = lm_logits[:, :-1, :].contiguous()
+        shift_labels = b_ids[:, 1:].contiguous()
+        shift_mask = b_mask[:, 1:].contiguous()
+        shift_labels = shift_labels.masked_fill(shift_mask == 0, -100)  # padding ignore
+        lm_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1), ignore_index=-100, reduction='mean')
+        class_loss = F.cross_entropy(logits, labels, reduction='mean')
+        loss = class_loss + args.lm_lambda * lm_loss
+      else:
+        logits = model(b_ids, b_mask)
+        loss = F.cross_entropy(logits, labels, reduction='mean')
       preds = torch.argmax(logits, dim=1)
-      loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
       optimizer.step()
+      if scheduler is not None:
+        scheduler.step()
 
       train_loss += loss.item()
       num_batches += 1
@@ -427,6 +475,12 @@ def get_args():
   parser.add_argument("--patience", type=int, default=None,
                       help="early stopping patience (epochs without dev improvement). 지정하지 않으면 비활성화")
   parser.add_argument("--weight_decay", type=float, default=0.01)
+  parser.add_argument("--lr_schedule", type=str, choices=['none', 'linear', 'cosine'], default='none',
+                      help="warmup 후 lr decay 형태. none=고정(기존 동작). linear/cosine=0까지 감소.")
+  parser.add_argument("--warmup_ratio", type=float, default=0.0,
+                      help="전체 step 중 선형 warmup 비율 (예: 0.06, 0.1). 0이면 warmup 없음.")
+  parser.add_argument("--lm_lambda", type=float, default=0.0,
+                      help="보조 LM(next-token) loss 가중치. 0이면 분류 loss만(기존 동작). >0이면 정규화로 추가.")
   parser.add_argument("--balanced_sampler", action='store_true',
                       help="WeightedRandomSampler 로 epoch 당 pos:neg 50:50 강제 (학습 데이터 mix 가 한쪽으로 쏠릴 때 FPR/FNR 균형 회복)")
   parser.add_argument("--prior_calibration", action='store_true',
