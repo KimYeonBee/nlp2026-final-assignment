@@ -134,9 +134,11 @@ def model_test_paraphrase(dataloader, model, device):
 
 
 @torch.no_grad()
-def model_eval_paraphrase_symmetric(dataloader_orig, dataloader_swap, model, device):
+def model_eval_paraphrase_symmetric(dataloader_orig, dataloader_swap, model, device,
+                                    prior_yes=0.0, prior_no=0.0):
   """Symmetry consistency: (S1,S2) 와 (S2,S1) 두 방향 logits 평균으로 예측.
   두 dataloader 는 동일한 데이터를 같은 순서로 (shuffle=False) 반환해야 함.
+  prior_{yes,no} 가 주어지면 평균 logit 에서 차감 (symmetric + prior_calibration 결합).
   """
   model.eval()
   y_true, y_pred, sent_ids = [], [], []
@@ -154,8 +156,8 @@ def model_eval_paraphrase_symmetric(dataloader_orig, dataloader_swap, model, dev
     logits_o = model(b_ids_o, b_mask_o)
     logits_s = model(b_ids_s, b_mask_s)
 
-    score_yes = 0.5 * logits_o[:, YES_TOKEN_ID] + 0.5 * logits_s[:, YES_TOKEN_ID]
-    score_no = 0.5 * logits_o[:, NO_TOKEN_ID] + 0.5 * logits_s[:, NO_TOKEN_ID]
+    score_yes = 0.5 * logits_o[:, YES_TOKEN_ID] + 0.5 * logits_s[:, YES_TOKEN_ID] - prior_yes
+    score_no = 0.5 * logits_o[:, NO_TOKEN_ID] + 0.5 * logits_s[:, NO_TOKEN_ID] - prior_no
     preds = torch.where(
         score_yes > score_no,
         torch.full_like(score_yes, YES_TOKEN_ID, dtype=torch.long),
@@ -172,8 +174,11 @@ def model_eval_paraphrase_symmetric(dataloader_orig, dataloader_swap, model, dev
 
 
 @torch.no_grad()
-def model_test_paraphrase_symmetric(dataloader_orig, dataloader_swap, model, device):
-  """Test split 용 symmetric 예측. label 없음."""
+def model_test_paraphrase_symmetric(dataloader_orig, dataloader_swap, model, device,
+                                    prior_yes=0.0, prior_no=0.0):
+  """Test split 용 symmetric 예측. label 없음.
+  prior_{yes,no} 가 주어지면 평균 logit 에서 차감 (symmetric + prior_calibration 결합).
+  """
   model.eval()
   y_pred, sent_ids = [], []
   for batch_orig, batch_swap in zip(
@@ -189,8 +194,8 @@ def model_test_paraphrase_symmetric(dataloader_orig, dataloader_swap, model, dev
     logits_o = model(b_ids_o, b_mask_o)
     logits_s = model(b_ids_s, b_mask_s)
 
-    score_yes = 0.5 * logits_o[:, YES_TOKEN_ID] + 0.5 * logits_s[:, YES_TOKEN_ID]
-    score_no = 0.5 * logits_o[:, NO_TOKEN_ID] + 0.5 * logits_s[:, NO_TOKEN_ID]
+    score_yes = 0.5 * logits_o[:, YES_TOKEN_ID] + 0.5 * logits_s[:, YES_TOKEN_ID] - prior_yes
+    score_no = 0.5 * logits_o[:, NO_TOKEN_ID] + 0.5 * logits_s[:, NO_TOKEN_ID] - prior_no
     preds = torch.where(
         score_yes > score_no,
         torch.full_like(score_yes, YES_TOKEN_ID, dtype=torch.long),

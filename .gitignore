@@ -6,3 +6,11 @@
 .idea/
 out/
 wandb/
+# 학습/추론 산출물 (재현 가능, repo 무겁게 만듦)
+predictions/*.csv
+data/paraphrase_extra_data/
+logs/
+# 분석 HTML 리포트 (재생성 가능)
+analysis/*.html
+# 일회성 실험 스크립트 (실험 끝나면 삭제)
+run_phase*.sh

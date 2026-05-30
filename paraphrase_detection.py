@@ -175,12 +175,20 @@ def train(args):
   }
 
   if args.use_wandb:
+    # 모델 크기 (gpt2 → small, gpt2-medium → medium, gpt2-large → large) 와 옵션 태그
+    _size_tag = args.model_size.replace('gpt2-', '').replace('gpt2', 'small')
+    _opt_tags = []
+    if args.balanced_sampler: _opt_tags.append('balanced')
+    if args.swap_augment:     _opt_tags.append('swapaug')
+    if args.symmetric_eval:   _opt_tags.append('symeval')
+    if args.prior_calibration:_opt_tags.append('prior')
+    _opt_suffix = ('-' + '-'.join(_opt_tags)) if _opt_tags else ''
     wandb.init(
         project='paraphrase_detection',
         # name=f'gpt2-{config["dataset"]}-lr{args.lr}-epoch{args.epochs}-patience{args.patience}-weight_decay{args.weight_decay}', # 기타 수정한 사항 name에 구분가게 표시
         # >>> ABLATION-ONLY: 실험 끝나면 group 줄 삭제 + name 줄을 위 주석으로 되돌리기 <<<
         group='Ablation',
-        name=f'gpt2-ablation-{config["dataset"]}-epoch{args.epochs}',
+        name=f'gpt2-ablation-{config["dataset"]}-{_size_tag}{_opt_suffix}-epoch{args.epochs}',
         # >>> END ABLATION-ONLY <<<
         config=config
     )
@@ -352,12 +360,14 @@ def test(args):
         f.write(f"{p}, {s} \n")
 
     # symmetric_eval: 같은 dev 에 대해 swap 평균 예측을 *-symmetric.csv 로 따로 저장
+    # prior_calibration 과 함께 켜면 평균 logit 에서 prior 도 차감됨 (진짜 결합 효과).
     if args.symmetric_eval:
       ds_swap = ParaphraseDetectionDataset(data, args, swap=True)
       loader_swap = DataLoader(ds_swap, shuffle=False, batch_size=args.batch_size,
                                collate_fn=ds_swap.collate_fn)
       sym_acc, _, sym_y_pred, _, sym_sent_ids = model_eval_paraphrase_symmetric(
-          loader, loader_swap, model, device)
+          loader, loader_swap, model, device,
+          prior_yes=prior_yes, prior_no=prior_no)
       print(f"dev paraphrase acc (symmetric) [{dev_fp}] :: {sym_acc :.3f}")
       sym_out = dev_out_fp.replace('.csv', '-symmetric.csv')
       with open(sym_out, "w+") as f:
@@ -387,7 +397,8 @@ def test(args):
       loader_swap = DataLoader(ds_swap, shuffle=False, batch_size=args.batch_size,
                                collate_fn=ds_swap.collate_fn)
       sym_test_y_pred, sym_test_sent_ids = model_test_paraphrase_symmetric(
-          loader, loader_swap, model, device)
+          loader, loader_swap, model, device,
+          prior_yes=prior_yes, prior_no=prior_no)
       sym_out = test_out_fp.replace('.csv', '-symmetric.csv')
       print(f"test predictions saved (symmetric) [{test_fp}] -> {sym_out}")
       with open(sym_out, "w+") as f:
@@ -422,6 +433,8 @@ def get_args():
                       help="추론 시 빈 문장 페어로 prior (yes/no logit) 추정 후 실제 logit 에서 차감. 사전 편향 제거 — bt 셀처럼 yes 쪽으로 쏠린 모델 보정에 사용.")
   parser.add_argument("--swap_augment", action='store_true',
                       help="훈련 데이터에 (S2,S1,label) swap 버전을 추가해 2배로 늘림 (순서 대칭성 학습)")
+  parser.add_argument("--eval_only", action='store_true',
+                      help='train() 건너뛰고 기존 체크포인트로 test() 만 실행 (inference-only).')
   parser.add_argument("--symmetric_eval", action='store_true',
                       help="dev/test 평가 시 (S1,S2)와 (S2,S1) yes/no logit 평균으로 추가 예측 → *-symmetric.csv 로 저장")
   parser.add_argument("--model_size", type=str,
@@ -456,7 +469,12 @@ if __name__ == "__main__":
   # args.filepath = f'{args.epochs}-{args.lr}-wd{args.weight_decay}-pat{args.patience}-paraphrase.pt'  # 경로명 저장.
   args.filepath = f'{Path(args.para_train).stem}-{args.epochs}-...-paraphrase.pt'
   seed_everything(args.seed)  # 재현성을 위한 random seed 고정.
-  train(args)
+  if not args.eval_only:
+    train(args)
+  else:
+    # eval_only: model_size 등 add_arguments 로만 채워지는 값 보충
+    args = add_arguments(args)
+    print(f"[eval_only] train() 스킵, 기존 체크포인트 {args.filepath} 로 test() 만 실행")
   test(args)
 
   # 나중에 삭제
